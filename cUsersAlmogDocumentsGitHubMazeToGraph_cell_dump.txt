@@ -1,0 +1,1703 @@
+=== CELL 10 (code) ===
+# NEW APPROACH: Spatial consistency-based jump detection (no speed consideration)
+
+def detect_jumps_spatial(x, y, likelihood, 
+                         likelihood_threshold=0.9,
+                         spatial_window=10,
+                         position_outlier_threshold=3.0):
+    """
+    Detect tracking jumps using multiple criteria.
+    
+    Parameters:
+    -----------
+    x, y : array
+        Tracking coordinates
+    likelihood : array
+        Tracking confidence
+    speed : array
+        Frame-to-frame speed
+    speed_threshold_multiplier : float
+        Multiplier of median speed to flag as jump
+    likelihood_threshold : float
+        Likelihood below this is suspicious
+    max_speed_threshold : float
+        Absolute maximum reasonable speed (pixels/frame)
+    window_size : int
+        Window for local statistics
+        
+    Returns:
+    --------
+    jump_mask : boolean array
+        True for frames identified as jumps
+    jump_info : dict
+        Dictionary with detection statistics
+    """
+    n_frames = len(x)
+    jump_mask = np.zeros(n_frames, dtype=bool)
+    
+    # Criterion 1: Excessive speed (velocity-based)
+    median_speed = np.nanmedian(speed)
+    mad_speed = np.nanmedian(np.abs(speed - median_speed))
+    speed_threshold = median_speed + speed_threshold_multiplier * mad_speed
+    speed_jumps = speed > speed_threshold
+    
+    # Criterion 2: Absolute maximum speed
+    absolute_speed_jumps = speed > max_speed_threshold
+    
+    # Criterion 3: Low likelihood
+    likelihood_jumps = likelihood < likelihood_threshold
+    
+    # Criterion 4: Local inconsistency (sudden direction changes)
+    direction_changes = np.zeros(n_frames, dtype=bool)
+    for i in range(window_size, n_frames - window_size):
+        # Check if position is outlier compared to local window
+        local_x = np.concatenate([x[i-window_size:i], x[i+1:i+window_size+1]])
+        local_y = np.concatenate([y[i-window_size:i], y[i+1:i+window_size+1]])
+        
+        local_median_x = np.nanmedian(local_x)
+        local_median_y = np.nanmedian(local_y)
+        local_mad_x = np.nanmedian(np.abs(local_x - local_median_x))
+        local_mad_y = np.nanmedian(np.abs(local_y - local_median_y))
+        
+        # Check if current position is far from local median
+        if local_mad_x > 0:
+            x_outlier = np.abs(x[i] - local_median_x) > 3 * local_mad_x
+        else:
+            x_outlier = False
+            
+        if local_mad_y > 0:
+            y_outlier = np.abs(y[i] - local_median_y) > 3 * local_mad_y
+        else:
+            y_outlier = False
+            
+        direction_changes[i] = x_outlier or y_outlier
+    
+    # Combine criteria (any two must be true for robust detection)
+    criteria_count = (speed_jumps.astype(int) + 
+                     absolute_speed_jumps.astype(int) + 
+                     likelihood_jumps.astype(int) + 
+                     direction_changes.astype(int))
+    
+    jump_mask = criteria_count >= 2
+    
+    # Conservative expansion: only expand if neighboring frames also look suspicious
+    # This prevents merging distant jumps into one long segment
+    jump_mask_expanded = jump_mask.copy()
+    for i in np.where(jump_mask)[0]:
+        # Only expand to neighbors that have at least 1 criterion met
+        if i > 0 and criteria_count[i-1] >= 1:
+            jump_mask_expanded[i-1] = True
+        if i < n_frames - 1 and criteria_count[i+1] >= 1:
+            jump_mask_expanded[i+1] = True
+    
+    # Split very long segments that might contain real movement
+    # Find segments in the expanded mask
+    temp_segments = []
+    in_segment = False
+    segment_start = None
+    
+    for i in range(n_frames):
+        if jump_mask_expanded[i] and not in_segment:
+            segment_start = i
+            in_segment = True
+        elif not jump_mask_expanded[i] and in_segment:
+            temp_segments.append((segment_start, i-1))
+            in_segment = False
+    
+    if in_segment:
+        temp_segments.append((segment_start, n_frames-1))
+    
+    # For segments longer than 10 frames, check if there are good frames inside
+    # that should not be corrected
+    for start, end in temp_segments:
+        seg_len = end - start + 1
+        if seg_len > 10:
+            # Check likelihood and criteria count within the segment
+            for i in range(start, end + 1):
+                # If frame has high likelihood and only 1 or 0 criteria,
+                # it's probably fine - don't correct it
+                if likelihood[i] > likelihood_threshold + 0.05 and criteria_count[i] <= 1:
+                    jump_mask_expanded[i] = False
+    
+    # Collect statistics
+    jump_info = {
+        'n_jumps': np.sum(jump_mask_expanded),
+        'jump_percentage': 100 * np.sum(jump_mask_expanded) / n_frames,
+        'speed_threshold': speed_threshold,
+        'median_speed': median_speed,
+        'mad_speed': mad_speed,
+        'max_speed_threshold': max_speed_threshold,
+        'likelihood_threshold': likelihood_threshold,
+        'speed_jumps': np.sum(speed_jumps),
+        'absolute_speed_jumps': np.sum(absolute_speed_jumps),
+        'likelihood_jumps': np.sum(likelihood_jumps),
+        'direction_changes': np.sum(direction_changes),
+        'multi_criteria_jumps': np.sum(jump_mask),
+        'expanded_jumps': np.sum(jump_mask_expanded)
+    }
+    
+    return jump_mask_expanded, jump_info
+
+# Detect jumps
+jump_mask, jump_info = detect_jumps_multicriteria(
+    headstage_x, headstage_y, headstage_likelihood, speed
+)
+
+print("=" * 60)
+print("JUMP DETECTION STATISTICS")
+print("=" * 60)
+print(f"\nTotal frames analyzed: {len(headstage_x):,}")
+print(f"Frames flagged as jumps: {jump_info['n_jumps']:,} ({jump_info['jump_percentage']:.2f}%)")
+print(f"\nDetection criteria:")
+print(f"  Speed threshold: {jump_info['speed_threshold']:.2f} pixels/frame")
+print(f"    (median: {jump_info['median_speed']:.2f}, MAD: {jump_info['mad_speed']:.2f})")
+print(f"  Absolute speed limit: {jump_info['max_speed_threshold']:.2f} pixels/frame")
+print(f"  Likelihood threshold: {jump_info['likelihood_threshold']:.3f}")
+print(f"\nFrames flagged by each criterion:")
+print(f"  Excessive speed: {jump_info['speed_jumps']:,}")
+print(f"  Absolute speed limit: {jump_info['absolute_speed_jumps']:,}")
+print(f"  Low likelihood: {jump_info['likelihood_jumps']:,}")
+print(f"  Local spatial inconsistency: {jump_info['direction_changes']:,}")
+print(f"\nFrames meeting ≥2 criteria: {jump_info['multi_criteria_jumps']:,}")
+print(f"After expanding regions: {jump_info['expanded_jumps']:,}")
+
+# Identify jump segments (consecutive frames)
+jump_segments = []
+in_segment = False
+segment_start = None
+
+for i, is_jump in enumerate(jump_mask):
+    if is_jump and not in_segment:
+        segment_start = i
+        in_segment = True
+    elif not is_jump and in_segment:
+        jump_segments.append((segment_start, i-1))
+        in_segment = False
+
+if in_segment:
+    jump_segments.append((segment_start, len(jump_mask)-1))
+
+print(f"\nNumber of jump segments: {len(jump_segments)}")
+if len(jump_segments) > 0:
+    segment_lengths = [end - start + 1 for start, end in jump_segments]
+    print(f"Jump segment statistics:")
+    print(f"  Mean length: {np.mean(segment_lengths):.1f} frames")
+    print(f"  Median length: {np.median(segment_lengths):.1f} frames")
+    print(f"  Max length: {np.max(segment_lengths)} frames")
+    print(f"  Min length: {np.min(segment_lengths)} frames")
+
+=== CELL 11 (code) ===
+# Jump correction using interpolation with context
+
+def correct_jumps(x, y, jump_mask, other_bodyparts_data=None, window_size=10):
+    """
+    Correct detected jumps using weighted interpolation.
+    
+    Parameters:
+    -----------
+    x, y : array
+        Original tracking coordinates
+    jump_mask : boolean array
+        True for frames to correct (expanded mask)
+    other_bodyparts_data : dict, optional
+        Dictionary with other bodyparts for consistency checking
+    window_size : int
+        Window size for calculating interpolation context
+        
+    Returns:
+    --------
+    x_corrected, y_corrected : arrays
+        Corrected coordinates
+    """
+    x_corrected = x.copy()
+    y_corrected = y.copy()
+    
+    # Find jump segments
+    jump_segments = []
+    in_segment = False
+    segment_start = None
+    
+    for i, is_jump in enumerate(jump_mask):
+        if is_jump and not in_segment:
+            segment_start = i
+            in_segment = True
+        elif not is_jump and in_segment:
+            jump_segments.append((segment_start, i-1))
+            in_segment = False
+    
+    if in_segment:
+        jump_segments.append((segment_start, len(jump_mask)-1))
+    
+    # Correct each segment
+    for start, end in jump_segments:
+        segment_length = end - start + 1
+        
+        # Find the actual good frames before and after (skip any jumps in the window)
+        # Search backwards from start to find first non-jump frame
+        before_end = start - 1
+        while before_end >= 0 and jump_mask[before_end]:
+            before_end -= 1
+        
+        # Search forwards from end to find first non-jump frame  
+        after_start = end + 1
+        while after_start < len(jump_mask) and jump_mask[after_start]:
+            after_start += 1
+        
+        # Get context windows before and after from good frames only
+        before_start = max(0, before_end - window_size + 1) if before_end >= 0 else -1
+        after_end = min(len(x) - 1, after_start + window_size - 1) if after_start < len(x) else len(x)
+        
+        # Check if we have valid context before and after
+        has_before = before_end >= 0
+        has_after = after_start < len(x)
+        
+        # Calculate expected position using velocity before and after
+        if has_before and has_after:
+            # We have both before and after context - use both for interpolation
+            
+            # Get velocities before jump (from good frames only)
+            if before_end >= before_start and before_end > before_start:
+                vx_before = np.nanmean(np.diff(x[before_start:before_end+1]))
+                vy_before = np.nanmean(np.diff(y[before_start:before_end+1]))
+            else:
+                vx_before = 0
+                vy_before = 0
+            
+            # Get velocities after jump (from good frames only)
+            if after_start <= after_end and after_end > after_start:
+                vx_after = np.nanmean(np.diff(x[after_start:after_end+1]))
+                vy_after = np.nanmean(np.diff(y[after_start:after_end+1]))
+            else:
+                vx_after = 0
+                vy_after = 0
+            
+            # Weighted average of velocities
+            vx_avg = (vx_before + vx_after) / 2
+            vy_avg = (vy_before + vy_after) / 2
+            
+            # Linear interpolation with velocity guidance
+            # Use the LAST GOOD frame before and FIRST GOOD frame after
+            for i, idx in enumerate(range(start, end + 1)):
+                t = (i + 1) / (segment_length + 1)  # Interpolation weight
+                
+                # Position-based interpolation between good points
+                x_interp_pos = x[before_end] * (1 - t) + x[after_start] * t
+                y_interp_pos = y[before_end] * (1 - t) + y[after_start] * t
+                
+                # Velocity-based prediction from before point
+                x_interp_vel = x[before_end] + vx_avg * (i + 1)
+                y_interp_vel = y[before_end] + vy_avg * (i + 1)
+                
+                # Weighted combination (favor position for short jumps, velocity for long)
+                if segment_length <= 3:
+                    weight_pos = 0.7
+                else:
+                    weight_pos = 0.3
+                
+                x_corrected[idx] = weight_pos * x_interp_pos + (1 - weight_pos) * x_interp_vel
+                y_corrected[idx] = weight_pos * y_interp_pos + (1 - weight_pos) * y_interp_vel
+        
+        elif has_before:
+            # Only before context available - extrapolate forward
+            if before_end >= before_start and before_end > before_start:
+                vx = np.nanmean(np.diff(x[before_start:before_end+1]))
+                vy = np.nanmean(np.diff(y[before_start:before_end+1]))
+            else:
+                vx = 0
+                vy = 0
+            
+            for i, idx in enumerate(range(start, end + 1)):
+                x_corrected[idx] = x[before_end] + vx * (i + 1)
+                y_corrected[idx] = y[before_end] + vy * (i + 1)
+        
+        elif has_after:
+            # Only after context available - extrapolate backward
+            if after_start <= after_end and after_end > after_start:
+                vx = np.nanmean(np.diff(x[after_start:after_end+1]))
+                vy = np.nanmean(np.diff(y[after_start:after_end+1]))
+            else:
+                vx = 0
+                vy = 0
+            
+            for i, idx in enumerate(range(start, end + 1)):
+                offset = segment_length - i
+                x_corrected[idx] = x[after_start] - vx * offset
+                y_corrected[idx] = y[after_start] - vy * offset
+    
+    return x_corrected, y_corrected
+
+# Apply correction
+headstage_x_corrected, headstage_y_corrected = correct_jumps(
+    headstage_x, headstage_y, jump_mask
+)
+
+# Calculate correction statistics
+corrections = jump_mask
+correction_distances = np.sqrt(
+    (headstage_x_corrected - headstage_x)**2 + 
+    (headstage_y_corrected - headstage_y)**2
+)
+correction_distances_jumps = correction_distances[corrections]
+
+print("\n" + "=" * 60)
+print("CORRECTION STATISTICS")
+print("=" * 60)
+print(f"\nFrames corrected: {np.sum(corrections):,}")
+print(f"Correction distances (pixels):")
+print(f"  Mean: {np.nanmean(correction_distances_jumps):.2f}")
+print(f"  Median: {np.nanmedian(correction_distances_jumps):.2f}")
+print(f"  Max: {np.nanmax(correction_distances_jumps):.2f}")
+print(f"  Min: {np.nanmin(correction_distances_jumps):.2f}")
+
+# Recalculate speed after correction
+velocity_x_corrected = np.diff(headstage_x_corrected, prepend=headstage_x_corrected[0])
+velocity_y_corrected = np.diff(headstage_y_corrected, prepend=headstage_y_corrected[0])
+speed_corrected = np.sqrt(velocity_x_corrected**2 + velocity_y_corrected**2)
+
+print(f"\nSpeed comparison (pixels/frame):")
+print(f"  Original mean: {np.nanmean(speed):.2f}")
+print(f"  Corrected mean: {np.nanmean(speed_corrected):.2f}")
+print(f"  Original 99th percentile: {np.nanpercentile(speed, 99):.2f}")
+print(f"  Corrected 99th percentile: {np.nanpercentile(speed_corrected, 99):.2f}")
+
+=== CELL 12 (code) ===
+# Debug: Visualize a specific jump segment to verify correction logic
+
+# Find a representative jump segment
+if len(jump_segments) > 0:
+    # Pick a middle-sized segment for inspection
+    segment_lengths_with_idx = [(i, end - start + 1) for i, (start, end) in enumerate(jump_segments)]
+    segment_lengths_with_idx.sort(key=lambda x: x[1])
+    mid_idx = len(segment_lengths_with_idx) // 2
+    seg_idx, seg_len = segment_lengths_with_idx[mid_idx]
+    
+    start, end = jump_segments[seg_idx]
+    
+    # Show context around this jump
+    context = 20
+    plot_start = max(0, start - context)
+    plot_end = min(len(headstage_x) - 1, end + context)
+    
+    print(f"\n{'='*60}")
+    print(f"DEBUGGING JUMP SEGMENT #{seg_idx + 1}")
+    print(f"{'='*60}")
+    print(f"Jump segment: frames {start} to {end} (length: {seg_len})")
+    print(f"Showing frames {plot_start} to {plot_end}")
+    
+    # Find the reference points used for correction
+    before_end = start - 1
+    while before_end >= 0 and jump_mask[before_end]:
+        before_end -= 1
+    
+    after_start = end + 1
+    while after_start < len(jump_mask) and jump_mask[after_start]:
+        after_start += 1
+    
+    print(f"\nReference frames for interpolation:")
+    print(f"  Last good frame before jump: {before_end}")
+    print(f"  First good frame after jump: {after_start}")
+    if before_end >= 0:
+        print(f"    Position: ({headstage_x[before_end]:.1f}, {headstage_y[before_end]:.1f})")
+    if after_start < len(headstage_x):
+        print(f"    Position: ({headstage_x[after_start]:.1f}, {headstage_y[after_start]:.1f})")
+    
+    # Plot the segment
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Plot X coordinate
+    frames = np.arange(plot_start, plot_end + 1)
+    ax1.plot(frames, headstage_x[plot_start:plot_end+1], 'b.-', 
+            alpha=0.5, label='Original', markersize=4)
+    ax1.plot(frames, headstage_x_corrected[plot_start:plot_end+1], 'g.-', 
+            alpha=0.7, label='Corrected', markersize=4)
+    
+    # Mark the jump segment
+    jump_frames = frames[jump_mask[plot_start:plot_end+1]]
+    ax1.axvspan(start, end, alpha=0.2, color='red', label='Jump segment')
+    
+    # Mark reference points
+    if before_end >= plot_start and before_end <= plot_end:
+        ax1.plot(before_end, headstage_x[before_end], 'ko', markersize=10, 
+                label='Before ref', zorder=5)
+    if after_start >= plot_start and after_start <= plot_end:
+        ax1.plot(after_start, headstage_x[after_start], 'mo', markersize=10, 
+                label='After ref', zorder=5)
+    
+    ax1.set_xlabel('Frame')
+    ax1.set_ylabel('X coordinate (pixels)')
+    ax1.set_title('X Coordinate: Original vs Corrected')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+    
+    # Plot Y coordinate
+    ax2.plot(frames, headstage_y[plot_start:plot_end+1], 'b.-', 
+            alpha=0.5, label='Original', markersize=4)
+    ax2.plot(frames, headstage_y_corrected[plot_start:plot_end+1], 'g.-', 
+            alpha=0.7, label='Corrected', markersize=4)
+    
+    # Mark the jump segment
+    ax2.axvspan(start, end, alpha=0.2, color='red', label='Jump segment')
+    
+    # Mark reference points
+    if before_end >= plot_start and before_end <= plot_end:
+        ax2.plot(before_end, headstage_y[before_end], 'ko', markersize=10, 
+                label='Before ref', zorder=5)
+    if after_start >= plot_start and after_start <= plot_end:
+        ax2.plot(after_start, headstage_y[after_start], 'mo', markersize=10, 
+                label='After ref', zorder=5)
+    
+    ax2.set_xlabel('Frame')
+    ax2.set_ylabel('Y coordinate (pixels)')
+    ax2.set_title('Y Coordinate: Original vs Corrected')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"\nInterpretation:")
+    print(f"  - Blue line: Original tracking (with jumps)")
+    print(f"  - Green line: Corrected tracking (interpolated)")
+    print(f"  - Red shaded: Detected jump segment")
+    print(f"  - Black dot: Last good frame before jump (interpolation start)")
+    print(f"  - Magenta dot: First good frame after jump (interpolation end)")
+    print(f"\nThe corrected trajectory should interpolate BETWEEN the black and magenta points,")
+    print(f"NOT using any red-shaded (jump) frames as reference points.")
+else:
+    print("\nNo jump segments found to debug.")
+
+=== CELL 13 (code) ===
+# Inspect jump segments more carefully - look for problematic ones
+
+print("=" * 60)
+print("INSPECTING ALL JUMP SEGMENTS")
+print("=" * 60)
+
+# Analyze all segments to find potential issues
+problematic_segments = []
+
+for seg_idx, (start, end) in enumerate(jump_segments[:20]):  # Check first 20
+    seg_len = end - start + 1
+    
+    # Find reference points
+    before_end = start - 1
+    while before_end >= 0 and jump_mask[before_end]:
+        before_end -= 1
+    
+    after_start = end + 1
+    while after_start < len(jump_mask) and jump_mask[after_start]:
+        after_start += 1
+    
+    # Check if the correction makes sense
+    has_before = before_end >= 0
+    has_after = after_start < len(headstage_x)
+    
+    if has_before and has_after:
+        # Distance between reference points
+        ref_dist = np.sqrt((headstage_x[after_start] - headstage_x[before_end])**2 + 
+                          (headstage_y[after_start] - headstage_y[before_end])**2)
+        
+        # Average correction distance for this segment
+        seg_corrections = correction_distances[start:end+1]
+        avg_correction = np.mean(seg_corrections)
+        
+        # Check for potential issues
+        issue = False
+        issue_type = []
+        
+        # Issue 1: Very large reference distance (might indicate missing a jump)
+        if ref_dist > 50:
+            issue = True
+            issue_type.append("Large ref distance")
+        
+        # Issue 2: Correction is very large compared to reference distance
+        if avg_correction > ref_dist * 2:
+            issue = True
+            issue_type.append("Large correction")
+        
+        # Issue 3: Very long segment
+        if seg_len > 10:
+            issue = True
+            issue_type.append("Long segment")
+        
+        if issue or seg_idx < 5:  # Show first 5 or any problematic ones
+            print(f"\nSegment #{seg_idx + 1}: frames {start}-{end} (len={seg_len})")
+            print(f"  Before ref: {before_end}, After ref: {after_start}")
+            if has_before:
+                print(f"  Before pos: ({headstage_x[before_end]:.1f}, {headstage_y[before_end]:.1f})")
+            if has_after:
+                print(f"  After pos:  ({headstage_x[after_start]:.1f}, {headstage_y[after_start]:.1f})")
+            print(f"  Ref distance: {ref_dist:.1f} pixels")
+            print(f"  Avg correction: {avg_correction:.1f} pixels")
+            if issue_type:
+                print(f"  ⚠ Issues: {', '.join(issue_type)}")
+                problematic_segments.append((seg_idx, start, end, issue_type))
+
+print(f"\n{'=' * 60}")
+print(f"Found {len(problematic_segments)} potentially problematic segments")
+
+if len(problematic_segments) > 0:
+    print("\nMost problematic segment to visualize:")
+    seg_idx, start, end, issues = problematic_segments[0]
+    print(f"Segment #{seg_idx + 1}: frames {start}-{end}")
+    print(f"Issues: {', '.join(issues)}")
+
+=== CELL 14 (code) ===
+# Visualize the most problematic segment
+
+if len(problematic_segments) > 0:
+    # Pick the segment with longest length or largest issue
+    seg_idx, start, end, issues = max(problematic_segments, key=lambda x: x[2] - x[1])
+    
+    seg_len = end - start + 1
+    context = 30
+    plot_start = max(0, start - context)
+    plot_end = min(len(headstage_x) - 1, end + context)
+    
+    print(f"\n{'='*60}")
+    print(f"VISUALIZING MOST PROBLEMATIC SEGMENT #{seg_idx + 1}")
+    print(f"{'='*60}")
+    print(f"Jump segment: frames {start} to {end} (length: {seg_len})")
+    print(f"Issues: {', '.join(issues)}")
+    print(f"Showing frames {plot_start} to {plot_end}")
+    
+    # Find the reference points
+    before_end = start - 1
+    while before_end >= 0 and jump_mask[before_end]:
+        before_end -= 1
+    
+    after_start = end + 1
+    while after_start < len(jump_mask) and jump_mask[after_start]:
+        after_start += 1
+    
+    print(f"\nReference frames for interpolation:")
+    print(f"  Last good frame before jump: {before_end}")
+    print(f"  First good frame after jump: {after_start}")
+    if before_end >= 0:
+        print(f"    Position: ({headstage_x[before_end]:.1f}, {headstage_y[before_end]:.1f})")
+    if after_start < len(headstage_x):
+        print(f"    Position: ({headstage_x[after_start]:.1f}, {headstage_y[after_start]:.1f})")
+    
+    # Create comprehensive visualization
+    fig = plt.figure(figsize=(18, 10))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    
+    # Plot X coordinate
+    ax1 = fig.add_subplot(gs[0, 0])
+    frames = np.arange(plot_start, plot_end + 1)
+    ax1.plot(frames, headstage_x[plot_start:plot_end+1], 'b.-', 
+            alpha=0.5, label='Original', markersize=3, linewidth=1)
+    ax1.plot(frames, headstage_x_corrected[plot_start:plot_end+1], 'g.-', 
+            alpha=0.7, label='Corrected', markersize=3, linewidth=1.5)
+    ax1.axvspan(start, end, alpha=0.2, color='red', label='Jump segment')
+    
+    if before_end >= plot_start and before_end <= plot_end:
+        ax1.plot(before_end, headstage_x[before_end], 'ko', markersize=12, 
+                label='Before ref', zorder=5)
+        ax1.axvline(before_end, color='black', linestyle=':', alpha=0.5)
+    if after_start >= plot_start and after_start <= plot_end:
+        ax1.plot(after_start, headstage_x[after_start], 'mo', markersize=12, 
+                label='After ref', zorder=5)
+        ax1.axvline(after_start, color='magenta', linestyle=':', alpha=0.5)
+    
+    ax1.set_xlabel('Frame')
+    ax1.set_ylabel('X coordinate (pixels)')
+    ax1.set_title('X Coordinate: Original vs Corrected')
+    ax1.legend(fontsize=8)
+    ax1.grid(alpha=0.3)
+    
+    # Plot Y coordinate
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(frames, headstage_y[plot_start:plot_end+1], 'b.-', 
+            alpha=0.5, label='Original', markersize=3, linewidth=1)
+    ax2.plot(frames, headstage_y_corrected[plot_start:plot_end+1], 'g.-', 
+            alpha=0.7, label='Corrected', markersize=3, linewidth=1.5)
+    ax2.axvspan(start, end, alpha=0.2, color='red', label='Jump segment')
+    
+    if before_end >= plot_start and before_end <= plot_end:
+        ax2.plot(before_end, headstage_y[before_end], 'ko', markersize=12, 
+                label='Before ref', zorder=5)
+        ax2.axvline(before_end, color='black', linestyle=':', alpha=0.5)
+    if after_start >= plot_start and after_start <= plot_end:
+        ax2.plot(after_start, headstage_y[after_start], 'mo', markersize=12, 
+                label='After ref', zorder=5)
+        ax2.axvline(after_start, color='magenta', linestyle=':', alpha=0.5)
+    
+    ax2.set_xlabel('Frame')
+    ax2.set_ylabel('Y coordinate (pixels)')
+    ax2.set_title('Y Coordinate: Original vs Corrected')
+    ax2.legend(fontsize=8)
+    ax2.grid(alpha=0.3)
+    
+    # Plot speed
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(frames, speed[plot_start:plot_end+1], 'b.-', 
+            alpha=0.6, label='Original speed', markersize=3, linewidth=1)
+    ax3.plot(frames, speed_corrected[plot_start:plot_end+1], 'g.-', 
+            alpha=0.7, label='Corrected speed', markersize=3, linewidth=1.5)
+    ax3.axvspan(start, end, alpha=0.2, color='red')
+    ax3.axhline(jump_info['speed_threshold'], color='orange', linestyle='--', 
+               label='Speed threshold', alpha=0.7)
+    ax3.set_xlabel('Frame')
+    ax3.set_ylabel('Speed (pixels/frame)')
+    ax3.set_title('Speed Over Time')
+    ax3.legend(fontsize=8)
+    ax3.grid(alpha=0.3)
+    
+    # Plot likelihood
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.plot(frames, headstage_likelihood[plot_start:plot_end+1], 'b.-', 
+            alpha=0.6, markersize=3, linewidth=1)
+    ax4.axvspan(start, end, alpha=0.2, color='red', label='Jump segment')
+    ax4.axhline(jump_info['likelihood_threshold'], color='orange', linestyle='--', 
+               label='Likelihood threshold', alpha=0.7)
+    ax4.set_xlabel('Frame')
+    ax4.set_ylabel('Likelihood')
+    ax4.set_title('Tracking Likelihood')
+    ax4.legend(fontsize=8)
+    ax4.grid(alpha=0.3)
+    ax4.set_ylim([0, 1])
+    
+    # Plot trajectory on maze (zoomed)
+    ax5 = fig.add_subplot(gs[2, :])
+    
+    # Plot the trajectory segment
+    ax5.plot(headstage_x[plot_start:plot_end+1], headstage_y[plot_start:plot_end+1], 
+            'b.-', alpha=0.5, markersize=4, linewidth=1, label='Original')
+    ax5.plot(headstage_x_corrected[plot_start:plot_end+1], 
+            headstage_y_corrected[plot_start:plot_end+1], 
+            'g.-', alpha=0.7, markersize=4, linewidth=1.5, label='Corrected')
+    
+    # Mark jump frames
+    jump_frames_in_range = [i for i in range(start, end+1) if plot_start <= i <= plot_end]
+    if jump_frames_in_range:
+        ax5.scatter(headstage_x[jump_frames_in_range], 
+                   headstage_y[jump_frames_in_range], 
+                   c='red', s=50, alpha=0.7, edgecolors='white', linewidths=1,
+                   label='Jump frames', zorder=5)
+    
+    # Mark reference points
+    if before_end >= 0:
+        ax5.scatter(headstage_x[before_end], headstage_y[before_end], 
+                   c='black', s=150, marker='o', edgecolors='white', linewidths=2,
+                   label='Before ref', zorder=6)
+    if after_start < len(headstage_x):
+        ax5.scatter(headstage_x[after_start], headstage_y[after_start], 
+                   c='magenta', s=150, marker='o', edgecolors='white', linewidths=2,
+                   label='After ref', zorder=6)
+    
+    # Draw interpolation line
+    if before_end >= 0 and after_start < len(headstage_x):
+        ax5.plot([headstage_x[before_end], headstage_x[after_start]], 
+                [headstage_y[before_end], headstage_y[after_start]], 
+                'k--', alpha=0.5, linewidth=2, label='Interpolation line')
+    
+    ax5.set_xlabel('X (pixels)')
+    ax5.set_ylabel('Y (pixels)')
+    ax5.set_title('Spatial Trajectory (zoomed to segment)')
+    ax5.legend(fontsize=8, loc='best')
+    ax5.grid(alpha=0.3)
+    ax5.set_aspect('equal')
+    
+    plt.show()
+    
+    print(f"\n{'='*60}")
+    print("ANALYSIS:")
+    print(f"{'='*60}")
+    if seg_len > 10:
+        print("⚠ This is a LONG jump segment. Possible issues:")
+        print("  1. Multiple separate jumps merged into one segment")
+        print("  2. The 'expansion' logic might be too aggressive")
+        print("  3. Real movement happening during what's flagged as a jump")
+    
+    ref_dist = np.sqrt((headstage_x[after_start] - headstage_x[before_end])**2 + 
+                      (headstage_y[after_start] - headstage_y[before_end])**2)
+    if ref_dist > 50:
+        print(f"\n⚠ Large reference distance ({ref_dist:.1f} px)")
+        print("  This suggests the mouse actually moved significantly")
+        print("  OR the reference points themselves might include jumps")
+else:
+    print("\nNo problematic segments to visualize!")
+
+=== CELL 16 (code) ===
+# Improved correction with validation for real movement vs jumps
+
+def correct_jumps_smart(x, y, jump_mask, likelihood, other_bodyparts_data=None, window_size=10):
+    """
+    Correct detected jumps using weighted interpolation, but skip segments 
+    that appear to be real gradual movement rather than tracking errors.
+    """
+    x_corrected = x.copy()
+    y_corrected = y.copy()
+    
+    # Find jump segments
+    jump_segments = []
+    in_segment = False
+    segment_start = None
+    
+    for i, is_jump in enumerate(jump_mask):
+        if is_jump and not in_segment:
+            segment_start = i
+            in_segment = True
+        elif not is_jump and in_segment:
+            jump_segments.append((segment_start, i-1))
+            in_segment = False
+    
+    if in_segment:
+        jump_segments.append((segment_start, len(jump_mask)-1))
+    
+    segments_skipped = 0
+    segments_corrected = 0
+    
+    # Correct each segment
+    for start, end in jump_segments:
+        segment_length = end - start + 1
+        
+        # Check if this segment looks like real gradual movement
+        skip_correction = False
+        if segment_length > 8:
+            # Check if movement is gradual and directional
+            seg_x = x[start:end+1]
+            seg_y = y[start:end+1]
+            seg_likelihood = likelihood[start:end+1]
+            
+            # Calculate if movement is monotonic (consistent direction)
+            x_diff = np.diff(seg_x)
+            y_diff = np.diff(seg_y)
+            
+            # Check if movement is mostly in one direction
+            x_direction_consistency = np.abs(np.sum(np.sign(x_diff))) / len(x_diff) if len(x_diff) > 0 else 0
+            y_direction_consistency = np.abs(np.sum(np.sign(y_diff))) / len(y_diff) if len(y_diff) > 0 else 0
+            
+            # Check average likelihood
+            avg_likelihood = np.nanmean(seg_likelihood)
+            
+            # If movement is directionally consistent AND likelihood is high, 
+            # this is probably real movement, not a jump
+            if (x_direction_consistency > 0.6 or y_direction_consistency > 0.6) and avg_likelihood > 0.85:
+                skip_correction = True
+                segments_skipped += 1
+        
+        if skip_correction:
+            continue  # Don't correct this segment
+        
+        segments_corrected += 1
+        
+        # Find the actual good frames before and after
+        before_end = start - 1
+        while before_end >= 0 and jump_mask[before_end]:
+            before_end -= 1
+        
+        after_start = end + 1
+        while after_start < len(jump_mask) and jump_mask[after_start]:
+            after_start += 1
+        
+        # Get context windows
+        before_start = max(0, before_end - window_size + 1) if before_end >= 0 else -1
+        after_end = min(len(x) - 1, after_start + window_size - 1) if after_start < len(x) else len(x)
+        
+        has_before = before_end >= 0
+        has_after = after_start < len(x)
+        
+        # Calculate expected position using velocity before and after
+        if has_before and has_after:
+            # Get velocities
+            if before_end >= before_start and before_end > before_start:
+                vx_before = np.nanmean(np.diff(x[before_start:before_end+1]))
+                vy_before = np.nanmean(np.diff(y[before_start:before_end+1]))
+            else:
+                vx_before = 0
+                vy_before = 0
+            
+            if after_start <= after_end and after_end > after_start:
+                vx_after = np.nanmean(np.diff(x[after_start:after_end+1]))
+                vy_after = np.nanmean(np.diff(y[after_start:after_end+1]))
+            else:
+                vx_after = 0
+                vy_after = 0
+            
+            vx_avg = (vx_before + vx_after) / 2
+            vy_avg = (vy_before + vy_after) / 2
+            
+            # Interpolate
+            for i, idx in enumerate(range(start, end + 1)):
+                t = (i + 1) / (segment_length + 1)
+                
+                x_interp_pos = x[before_end] * (1 - t) + x[after_start] * t
+                y_interp_pos = y[before_end] * (1 - t) + y[after_start] * t
+                
+                x_interp_vel = x[before_end] + vx_avg * (i + 1)
+                y_interp_vel = y[before_end] + vy_avg * (i + 1)
+                
+                if segment_length <= 3:
+                    weight_pos = 0.7
+                else:
+                    weight_pos = 0.3
+                
+                x_corrected[idx] = weight_pos * x_interp_pos + (1 - weight_pos) * x_interp_vel
+                y_corrected[idx] = weight_pos * y_interp_pos + (1 - weight_pos) * y_interp_vel
+        
+        elif has_before:
+            if before_end >= before_start and before_end > before_start:
+                vx = np.nanmean(np.diff(x[before_start:before_end+1]))
+                vy = np.nanmean(np.diff(y[before_start:before_end+1]))
+            else:
+                vx = 0
+                vy = 0
+            
+            for i, idx in enumerate(range(start, end + 1)):
+                x_corrected[idx] = x[before_end] + vx * (i + 1)
+                y_corrected[idx] = y[before_end] + vy * (i + 1)
+        
+        elif has_after:
+            if after_start <= after_end and after_end > after_start:
+                vx = np.nanmean(np.diff(x[after_start:after_end+1]))
+                vy = np.nanmean(np.diff(y[after_start:after_end+1]))
+            else:
+                vx = 0
+                vy = 0
+            
+            for i, idx in enumerate(range(start, end + 1)):
+                offset = segment_length - i
+                x_corrected[idx] = x[after_start] - vx * offset
+                y_corrected[idx] = y[after_start] - vy * offset
+    
+    print(f"Smart correction: {segments_corrected} segments corrected, {segments_skipped} segments skipped (likely real movement)")
+    
+    return x_corrected, y_corrected
+
+# Apply smart correction
+headstage_x_smart = headstage_x.copy()
+headstage_y_smart = headstage_y.copy()
+
+headstage_x_smart, headstage_y_smart = correct_jumps_smart(
+    headstage_x, headstage_y, jump_mask, headstage_likelihood
+)
+
+# Calculate correction statistics for smart correction
+correction_distances_smart = np.sqrt(
+    (headstage_x_smart - headstage_x)**2 + 
+    (headstage_y_smart - headstage_y)**2
+)
+actually_corrected = correction_distances_smart > 0.1
+correction_distances_smart_nonzero = correction_distances_smart[actually_corrected]
+
+print(f"\nSmart correction statistics:")
+print(f"Frames actually corrected: {np.sum(actually_corrected):,}")
+print(f"Frames skipped: {np.sum(jump_mask) - np.sum(actually_corrected):,}")
+print(f"Correction distances (pixels):")
+if len(correction_distances_smart_nonzero) > 0:
+    print(f"  Mean: {np.nanmean(correction_distances_smart_nonzero):.2f}")
+    print(f"  Median: {np.nanmedian(correction_distances_smart_nonzero):.2f}")
+    print(f"  Max: {np.nanmax(correction_distances_smart_nonzero):.2f}")
+
+=== CELL 18 (code) ===
+# Calculate trial start times and prepare for per-trial visualization
+# Flatten trial_times_maze to convert from 2D to 1D array
+trial_times_maze_flat = trial_times_maze.flatten()
+trial_start_times = np.cumsum(np.concatenate([[0], trial_times_maze_flat[:-1]]))
+trial_end_times = np.cumsum(trial_times_maze_flat)
+
+# Convert to frame indices (40 Hz frame rate)
+fps = 40
+trial_start_frames = (trial_start_times * fps).astype(int)
+trial_end_frames = (trial_end_times * fps).astype(int)
+print(f"Number of trials: {len(trial_times_maze_flat)}")
+print(f"Trial duration statistics (seconds):")
+print(f"  Mean: {np.mean(trial_times_maze_flat):.2f}")
+print(f"  Median: {np.median(trial_times_maze_flat):.2f}")
+print(f"  Min: {np.min(trial_times_maze_flat):.2f}")
+print(f"  Max: {np.max(trial_times_maze_flat):.2f}")
+print(f"  Min: {np.min(trial_times_maze):.2f}")
+print(f"  Max: {np.max(trial_times_maze):.2f}")
+
+# Count jumps per trial
+jumps_per_trial = []
+for i in range(len(trial_start_frames)):
+    start_frame = trial_start_frames[i]
+    end_frame = trial_end_frames[i]
+    if end_frame > len(jump_mask):
+        end_frame = len(jump_mask)
+    n_jumps = np.sum(jump_mask[start_frame:end_frame])
+    jumps_per_trial.append(n_jumps)
+
+print(f"\nJumps per trial statistics:")
+print(f"  Mean: {np.mean(jumps_per_trial):.1f}")
+print(f"  Median: {np.median(jumps_per_trial):.1f}")
+print(f"  Max: {np.max(jumps_per_trial)}")
+print(f"  Trials with jumps: {np.sum(np.array(jumps_per_trial) > 0)}/{len(jumps_per_trial)}")
+
+=== CELL 19 (code) ===
+# Visualization: Plot trajectories per trial with jump detection
+
+def plot_trial_trajectory(trial_idx, x_orig, y_orig, x_corr, y_corr, 
+                          jump_mask, maze_img, start_frame, end_frame, 
+                          fps=40, figsize=(16, 6)):
+    """
+    Plot original and corrected trajectories for a single trial.
+    """
+    # Extract trial data
+    trial_x_orig = x_orig[start_frame:end_frame]
+    trial_y_orig = y_orig[start_frame:end_frame]
+    trial_x_corr = x_corr[start_frame:end_frame]
+    trial_y_corr = y_corr[start_frame:end_frame]
+    trial_jumps = jump_mask[start_frame:end_frame]
+    
+    # Time in trial (for color coding)
+    trial_duration = (end_frame - start_frame) / fps
+    time_in_trial = np.linspace(0, trial_duration, end_frame - start_frame)
+    
+    # Count jumps in this trial
+    n_jumps = np.sum(trial_jumps)
+    
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    
+    # Plot 1: Original trajectory with jumps
+    ax = axes[0]
+    ax.imshow(maze_img)
+    
+    # Color-coded trajectory
+    scatter = ax.scatter(trial_x_orig, trial_y_orig, c=time_in_trial, 
+                        cmap='viridis', s=10, alpha=0.6, label='Trajectory')
+    
+    # Mark jumps
+    jump_indices = np.where(trial_jumps)[0]
+    if len(jump_indices) > 0:
+        ax.scatter(trial_x_orig[jump_indices], trial_y_orig[jump_indices], 
+                  c='red', s=1, marker='o', edgecolors='white', linewidths=1.5,
+                  label=f'Jumps (n={n_jumps})', zorder=5)
+    
+    ax.set_title(f'Trial {trial_idx + 1} - Original Trajectory\n{n_jumps} jumps detected', 
+                fontsize=12, fontweight='bold')
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    ax.legend(loc='upper right')
+    
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label('Time in trial (s)', rotation=270, labelpad=15)
+    
+    # Plot 2: Corrected trajectory
+    ax = axes[1]
+    ax.imshow(maze_img)
+    
+    # Color-coded corrected trajectory
+    scatter = ax.scatter(trial_x_corr, trial_y_corr, c=time_in_trial, 
+                        cmap='viridis', s=10, alpha=0.6, label='Corrected trajectory')
+    
+    # Mark where corrections were made
+    if len(jump_indices) > 0:
+        ax.scatter(trial_x_corr[jump_indices], trial_y_corr[jump_indices], 
+                  c='lime', s=1, marker='o', edgecolors='white', linewidths=1.5,
+                  label=f'Corrected points (n={n_jumps})', zorder=5)
+        
+        # Draw arrows showing corrections
+        for idx in jump_indices[::max(1, len(jump_indices)//20)]:  # Show max 20 arrows
+            ax.annotate('', xy=(trial_x_corr[idx], trial_y_corr[idx]),
+                       xytext=(trial_x_orig[idx], trial_y_orig[idx]),
+                       arrowprops=dict(arrowstyle='->', color='orange', 
+                                     lw=1.5, alpha=0.7))
+    
+    ax.set_title(f'Trial {trial_idx + 1} - Corrected Trajectory', 
+                fontsize=12, fontweight='bold')
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    ax.legend(loc='upper right')
+    
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label('Time in trial (s)', rotation=270, labelpad=15)
+    
+    plt.tight_layout()
+    return fig
+
+# Plot a subset of trials with the most jumps
+trials_with_jumps = [(i, jumps_per_trial[i]) for i in range(len(jumps_per_trial))]
+trials_with_jumps.sort(key=lambda x: x[1], reverse=True)
+
+print("Plotting trials with most detected jumps...")
+print("=" * 60)
+
+# Plot top 5 trials with most jumps
+n_plots = min(5, len([t for t in trials_with_jumps if t[1] > 0]))
+
+for plot_idx in range(n_plots):
+    trial_idx, n_jumps = trials_with_jumps[plot_idx]
+    print(f"\nTrial {trial_idx + 1}: {n_jumps} jumps detected")
+    
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    if end_frame > len(jump_mask):
+        end_frame = len(jump_mask)
+    
+    fig = plot_trial_trajectory(
+        trial_idx, headstage_x, headstage_y, 
+        headstage_x_corrected, headstage_y_corrected,
+        jump_mask, maze_image, start_frame, end_frame
+    )
+    plt.show()
+    
+if n_plots == 0:
+    print("\nNo jumps detected in any trial!")
+
+=== CELL 20 (code) ===
+# Overall visualization: Speed distribution and jump locations
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# Plot 1: Speed distribution
+ax = axes[0, 0]
+ax.hist(speed[~jump_mask], bins=100, alpha=0.7, label='Normal frames', color='blue', density=True)
+ax.hist(speed[jump_mask], bins=50, alpha=0.7, label='Jump frames', color='red', density=True)
+ax.axvline(jump_info['speed_threshold'], color='green', linestyle='--', 
+          linewidth=2, label=f'Threshold: {jump_info["speed_threshold"]:.1f}')
+ax.axvline(jump_info['median_speed'], color='orange', linestyle='--', 
+          linewidth=2, label=f'Median: {jump_info["median_speed"]:.1f}')
+ax.set_xlabel('Speed (pixels/frame)', fontsize=11)
+ax.set_ylabel('Density', fontsize=11)
+ax.set_title('Speed Distribution: Normal vs Jump Frames', fontsize=12, fontweight='bold')
+ax.legend()
+ax.set_xlim(0, np.nanpercentile(speed, 99.5))
+ax.grid(alpha=0.3)
+
+# Plot 2: Likelihood distribution
+ax = axes[0, 1]
+ax.hist(headstage_likelihood[~jump_mask], bins=50, alpha=0.7, 
+       label='Normal frames', color='blue', density=True)
+ax.hist(headstage_likelihood[jump_mask], bins=30, alpha=0.7, 
+       label='Jump frames', color='red', density=True)
+ax.axvline(jump_info['likelihood_threshold'], color='green', linestyle='--', 
+          linewidth=2, label=f'Threshold: {jump_info["likelihood_threshold"]:.2f}')
+ax.set_xlabel('Likelihood', fontsize=11)
+ax.set_ylabel('Density', fontsize=11)
+ax.set_title('Likelihood Distribution: Normal vs Jump Frames', fontsize=12, fontweight='bold')
+ax.legend()
+ax.grid(alpha=0.3)
+
+# Plot 3: Speed over time with jumps marked
+ax = axes[1, 0]
+time_seconds = np.arange(len(speed)) / fps
+ax.plot(time_seconds, speed, linewidth=0.5, alpha=0.6, color='blue', label='Speed')
+jump_times = time_seconds[jump_mask]
+jump_speeds = speed[jump_mask]
+ax.scatter(jump_times, jump_speeds, c='red', s=20, alpha=0.8, 
+          label=f'Jumps (n={np.sum(jump_mask)})', zorder=5)
+ax.axhline(jump_info['speed_threshold'], color='green', linestyle='--', 
+          linewidth=1.5, label='Threshold', alpha=0.7)
+ax.set_xlabel('Time (seconds)', fontsize=11)
+ax.set_ylabel('Speed (pixels/frame)', fontsize=11)
+ax.set_title('Speed Over Time with Detected Jumps', fontsize=12, fontweight='bold')
+ax.legend()
+ax.grid(alpha=0.3)
+ax.set_ylim(0, np.nanpercentile(speed, 99.9))
+
+# Plot 4: Full trajectory with jumps on maze
+ax = axes[1, 1]
+ax.imshow(maze_image)
+# Subsample for cleaner visualization
+subsample = max(1, len(headstage_x) // 5000)
+ax.plot(headstage_x[::subsample], headstage_y[::subsample], 
+       linewidth=0.5, alpha=0.3, color='blue', label='Trajectory')
+jump_x = headstage_x[jump_mask]
+jump_y = headstage_y[jump_mask]
+ax.scatter(jump_x, jump_y, c='red', s=30, alpha=0.7, 
+          edgecolors='white', linewidths=0.5,
+          label=f'Jumps (n={len(jump_x)})', zorder=5)
+ax.set_title('Full Trajectory with Jump Locations', fontsize=12, fontweight='bold')
+ax.set_xlabel('X (pixels)', fontsize=11)
+ax.set_ylabel('Y (pixels)', fontsize=11)
+ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+print("\nVisualization complete!")
+
+=== CELL 21 (code) ===
+# Check consistency with other bodyparts
+
+def check_bodypart_consistency(target_bp, other_bps, dlc_data, jump_mask, threshold_ratio=2.0):
+    """
+    Check if detected jumps in target bodypart are consistent with other bodyparts.
+    
+    Parameters:
+    -----------
+    target_bp : str
+        Name of the target bodypart (e.g., 'headstage')
+    other_bps : list
+        List of other bodypart names to check
+    dlc_data : DataFrame
+        DLC data with all bodyparts
+    jump_mask : boolean array
+        Detected jumps for target bodypart
+    threshold_ratio : float
+        Ratio of speed increase considered inconsistent
+        
+    Returns:
+    --------
+    consistency_report : dict
+        Report on consistency with other bodyparts
+    """
+    consistency_report = {}
+    
+    for bp in other_bps:
+        # Get other bodypart data
+        bp_x = dlc_data[bp]['x'].values
+        bp_y = dlc_data[bp]['y'].values
+        
+        # Calculate speed for other bodypart
+        bp_vx = np.diff(bp_x, prepend=bp_x[0])
+        bp_vy = np.diff(bp_y, prepend=bp_y[0])
+        bp_speed = np.sqrt(bp_vx**2 + bp_vy**2)
+        
+        # Check speed at jump locations
+        jump_indices = np.where(jump_mask)[0]
+        
+        # Compare median speed during jumps vs normal
+        bp_speed_normal = np.nanmedian(bp_speed[~jump_mask])
+        bp_speed_jumps = np.nanmedian(bp_speed[jump_mask])
+        
+        # Check if other bodypart also shows unusual movement
+        speed_ratio = bp_speed_jumps / bp_speed_normal if bp_speed_normal > 0 else 1.0
+        
+        consistency_report[bp] = {
+            'speed_normal': bp_speed_normal,
+            'speed_jumps': bp_speed_jumps,
+            'speed_ratio': speed_ratio,
+            'is_consistent': speed_ratio < threshold_ratio
+        }
+    
+    return consistency_report
+
+# Check consistency
+other_bodyparts = ['ear_R', 'ear_L', 'midbody', 'tailbase']
+consistency_report = check_bodypart_consistency(
+    'headstage', other_bodyparts, dlc_raw_h5, jump_mask
+)
+
+print("\n" + "=" * 60)
+print("BODYPART CONSISTENCY ANALYSIS")
+print("=" * 60)
+print("\nChecking if other bodyparts show similar movement during headstage jumps:")
+print("(If consistent, jump may be real movement; if not, likely tracking error)\n")
+
+for bp, report in consistency_report.items():
+    status = "✓ CONSISTENT" if report['is_consistent'] else "✗ INCONSISTENT"
+    print(f"{bp:12} - {status}")
+    print(f"  Normal speed: {report['speed_normal']:6.2f} px/frame")
+    print(f"  Jump speed:   {report['speed_jumps']:6.2f} px/frame")
+    print(f"  Speed ratio:  {report['speed_ratio']:6.2f}x")
+    print()
+
+# Summary
+n_consistent = sum(1 for r in consistency_report.values() if r['is_consistent'])
+print(f"Bodyparts consistent with jumps: {n_consistent}/{len(other_bodyparts)}")
+if n_consistent < len(other_bodyparts) / 2:
+    print("→ Most bodyparts show normal movement during jumps")
+    print("  This suggests headstage jumps are likely tracking errors.")
+else:
+    print("→ Most bodyparts show increased movement during jumps")
+    print("  Some detected 'jumps' may be real fast movements.")
+
+=== CELL 22 (code) ===
+# Save corrected data back to the DataFrame
+
+# Update the dataframe with corrected coordinates
+dlc_raw_h5[('headstage', 'x')] = headstage_x_corrected
+dlc_raw_h5[('headstage', 'y')] = headstage_y_corrected
+
+# Also calculate and store the weighted average position if needed
+# This uses all bodyparts except headstage for a robust position estimate
+bodyparts_for_weighted = ['ear_R', 'ear_L', 'midbody', 'tailbase']
+
+weighted_x = np.zeros(len(dlc_raw_h5))
+weighted_y = np.zeros(len(dlc_raw_h5))
+total_likelihood = np.zeros(len(dlc_raw_h5))
+
+for bp in bodyparts_for_weighted:
+    bp_x = dlc_raw_h5[bp]['x'].values
+    bp_y = dlc_raw_h5[bp]['y'].values
+    bp_likelihood = dlc_raw_h5[bp]['likelihood'].values
+    
+    weighted_x += bp_x * bp_likelihood
+    weighted_y += bp_y * bp_likelihood
+    total_likelihood += bp_likelihood
+
+# Avoid division by zero
+total_likelihood[total_likelihood == 0] = 1
+
+weighted_x = weighted_x / total_likelihood
+weighted_y = weighted_y / total_likelihood
+weighted_likelihood = total_likelihood / len(bodyparts_for_weighted)
+
+# Store weighted position
+dlc_raw_h5[('weighted', 'x')] = weighted_x
+dlc_raw_h5[('weighted', 'y')] = weighted_y
+dlc_raw_h5[('weighted', 'likelihood')] = weighted_likelihood
+
+print("\n" + "=" * 60)
+print("DATA UPDATE COMPLETE")
+print("=" * 60)
+print(f"\nUpdated headstage coordinates with {np.sum(jump_mask)} corrected frames")
+print(f"Added weighted average position using {len(bodyparts_for_weighted)} bodyparts")
+print(f"\nDataFrame shape: {dlc_raw_h5.shape}")
+print(f"Columns: {len(dlc_raw_h5.columns)}")
+
+# Display sample of updated data
+print("\nSample of corrected data:")
+print(dlc_raw_h5[['headstage', 'weighted']].head(10))
+
+=== CELL 25 (code) ===
+def estimate_low_likelihood_positions_piecewise(x, y, likelihood, trial_start_frames, trial_end_frames, 
+                                                 likelihood_threshold=0.85, min_movement=10):
+    """
+    Estimate positions for low-likelihood frames using piecewise linear interpolation.
+    For each gap of low-likelihood frames, interpolate between the two surrounding high-likelihood points.
+    
+    Parameters:
+    -----------
+    x, y : array-like
+        Position coordinates
+    likelihood : array-like
+        Likelihood values for each frame
+    trial_start_frames, trial_end_frames : array-like
+        Start and end frames for each trial
+    likelihood_threshold : float
+        Threshold for considering a point as high-likelihood (default: 0.85)
+    min_movement : float
+        Minimum movement in pixels required to process a trial (default: 10)
+    
+    Returns:
+    --------
+    x_estimated, y_estimated : arrays
+        Estimated positions (original for high-likelihood, interpolated for low-likelihood)
+    low_likelihood_mask : array
+        Boolean mask indicating which frames had low likelihood
+    trials_skipped : list
+        List of trial indices that were skipped due to minimal movement
+    interpolation_info : dict
+        Information about interpolation segments
+    """
+    
+    # Initialize output arrays with original values
+    x_estimated = x.copy()
+    y_estimated = y.copy()
+    
+    # Identify low-likelihood frames
+    low_likelihood_mask = likelihood < likelihood_threshold
+    
+    # Track skipped trials and interpolation segments
+    trials_skipped = []
+    trials_processed = []
+    interpolation_segments = []
+    total_interpolated = 0
+    
+    n_trials = len(trial_start_frames)
+    
+    print(f"Processing {n_trials} trials...")
+    print(f"Total frames with likelihood < {likelihood_threshold}: {low_likelihood_mask.sum()} ({100*low_likelihood_mask.sum()/len(likelihood):.2f}%)")
+    print("-" * 80)
+    
+    for trial_idx in range(n_trials):
+        start_frame = trial_start_frames[trial_idx]
+        end_frame = trial_end_frames[trial_idx]
+        
+        # Get trial data
+        trial_x = x[start_frame:end_frame]
+        trial_y = y[start_frame:end_frame]
+        trial_likelihood = likelihood[start_frame:end_frame]
+        
+        # Check if trial has enough movement
+        x_range = np.max(trial_x) - np.min(trial_x)
+        y_range = np.max(trial_y) - np.min(trial_y)
+        
+        if x_range < min_movement and y_range < min_movement:
+            trials_skipped.append(trial_idx)
+            continue
+        
+        # Get extended context including neighboring trials
+        # This helps with edge interpolation
+        context_start = start_frame
+        context_end = end_frame
+        
+        # Include previous trial if not the first trial
+        if trial_idx > 0:
+            prev_start = trial_start_frames[trial_idx - 1]
+            context_start = prev_start
+        
+        # Include next trial if not the last trial
+        if trial_idx < n_trials - 1:
+            next_end = trial_end_frames[trial_idx + 1]
+            context_end = next_end
+        
+        # Get extended data
+        context_x = x[context_start:context_end]
+        context_y = y[context_start:context_end]
+        context_likelihood = likelihood[context_start:context_end]
+        context_frames = np.arange(context_start, context_end)
+        
+        # Find high-likelihood points in the extended context
+        high_lik_indices = np.where(context_likelihood >= likelihood_threshold)[0]
+        
+        if len(high_lik_indices) < 2:
+            # Not enough high-likelihood points for interpolation
+            trials_skipped.append(trial_idx)
+            continue
+        
+        # For each low-likelihood frame in THIS trial, find surrounding high-likelihood points
+        trial_frames = np.arange(start_frame, end_frame)
+        trial_in_context = trial_frames - context_start  # Convert to context indices
+        
+        for local_idx, global_frame in enumerate(trial_frames):
+            if likelihood[global_frame] >= likelihood_threshold:
+                # Already high likelihood, skip
+                continue
+            
+            # Find the context index for this frame
+            context_idx = trial_in_context[local_idx]
+            
+            # Find the nearest high-likelihood points before and after
+            before_indices = high_lik_indices[high_lik_indices < context_idx]
+            after_indices = high_lik_indices[high_lik_indices > context_idx]
+            
+            if len(before_indices) == 0 or len(after_indices) == 0:
+                # Can't interpolate (no points on one side)
+                continue
+            
+            # Get the closest high-likelihood points
+            idx_before = before_indices[-1]  # Last point before
+            idx_after = after_indices[0]     # First point after
+            
+            frame_before = context_frames[idx_before]
+            frame_after = context_frames[idx_after]
+            
+            x_before = context_x[idx_before]
+            x_after = context_x[idx_after]
+            y_before = context_y[idx_before]
+            y_after = context_y[idx_after]
+            
+            # Linear interpolation between the two points
+            # Calculate the interpolation weight
+            total_gap = frame_after - frame_before
+            if total_gap > 0:
+                weight = (global_frame - frame_before) / total_gap
+                
+                # Interpolate X and Y
+                x_estimated[global_frame] = x_before + weight * (x_after - x_before)
+                y_estimated[global_frame] = y_before + weight * (y_after - y_before)
+                
+                total_interpolated += 1
+        
+        trials_processed.append(trial_idx)
+    
+    print(f"\nTrials processed: {len(trials_processed)}")
+    print(f"Trials skipped (minimal movement): {len(trials_skipped)}")
+    print(f"Frames interpolated: {total_interpolated}")
+    
+    interpolation_info = {
+        'total_interpolated': total_interpolated,
+        'trials_processed': len(trials_processed),
+        'trials_skipped': len(trials_skipped)
+    }
+    
+    return x_estimated, y_estimated, low_likelihood_mask, trials_skipped, trials_processed, interpolation_info
+
+# Apply piecewise interpolation-based estimation
+headstage_x_regressed, headstage_y_regressed, low_likelihood_mask, trials_skipped, trials_processed, interpolation_info = \
+    estimate_low_likelihood_positions_piecewise(
+        headstage_x, 
+        headstage_y, 
+        headstage_likelihood,
+        trial_start_frames,
+        trial_end_frames,
+        likelihood_threshold=0.85,
+        min_movement=10
+    )
+
+=== CELL 26 (code) ===
+# Visualize regression-based estimation results
+# Plot trials with the most low-likelihood frames
+
+# Calculate low-likelihood frames per trial
+low_likelihood_per_trial = []
+for trial_idx in range(len(trial_start_frames)):
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    n_low_likelihood = low_likelihood_mask[start_frame:end_frame].sum()
+    low_likelihood_per_trial.append((trial_idx, n_low_likelihood))
+
+# Sort trials by number of low-likelihood frames
+trials_sorted_by_low_likelihood = sorted(low_likelihood_per_trial, key=lambda x: x[1], reverse=True)
+
+# Select trials to plot: top trials with low-likelihood frames that were processed
+n_plots = 5
+trials_to_plot = []
+for trial_idx, n_low in trials_sorted_by_low_likelihood:
+    if trial_idx in trials_processed and len(trials_to_plot) < n_plots:
+        trials_to_plot.append(trial_idx)
+
+print(f"Plotting {len(trials_to_plot)} trials with most low-likelihood frames (that were processed):")
+for trial_idx in trials_to_plot:
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    n_low = low_likelihood_mask[start_frame:end_frame].sum()
+    print(f"  Trial {trial_idx}: {n_low} low-likelihood frames")
+
+# Create output directory
+regression_plots_dir = 'regression_estimation_plots'
+os.makedirs(regression_plots_dir, exist_ok=True)
+
+print(f"\nSaving plots to: {regression_plots_dir}/")
+print("-" * 80)
+
+# Plot each trial
+for plot_idx, trial_idx in enumerate(trials_to_plot):
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    
+    # Get trial data
+    trial_frames = np.arange(start_frame, end_frame)
+    trial_x = headstage_x[start_frame:end_frame]
+    trial_y = headstage_y[start_frame:end_frame]
+    trial_x_est = headstage_x_regressed[start_frame:end_frame]
+    trial_y_est = headstage_y_regressed[start_frame:end_frame]
+    trial_likelihood = headstage_likelihood[start_frame:end_frame]
+    trial_low_likelihood = low_likelihood_mask[start_frame:end_frame]
+    
+    # Create time array for color coding
+    trial_time = np.arange(len(trial_frames))
+    
+    # Create figure with 5 subplots (2x3 grid, with bottom-right empty)
+    fig = plt.figure(figsize=(20, 12))
+    gs = plt.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
+    
+    fig.suptitle(f'Trial {trial_idx}: Piecewise Linear Interpolation\n'
+                 f'{trial_low_likelihood.sum()} low-likelihood frames estimated', 
+                 fontsize=14, fontweight='bold')
+    
+    # Subplot 1: X coordinate - Original with low-likelihood marked
+    ax = fig.add_subplot(gs[0, 0])
+    # Plot high-likelihood points
+    high_lik_mask = ~trial_low_likelihood
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_x[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot low-likelihood points in red
+    ax.scatter(trial_frames[trial_low_likelihood], trial_x[trial_low_likelihood],
+              c='red', s=50, alpha=0.8, marker='x', linewidths=2,
+              label=f'Low likelihood (<0.85): {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('X Coordinate (pixels)', fontsize=11)
+    ax.set_title('Original X Position', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # Subplot 2: Y coordinate - Original with low-likelihood marked
+    ax = fig.add_subplot(gs[0, 1])
+    # Plot high-likelihood points
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_y[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot low-likelihood points in red
+    ax.scatter(trial_frames[trial_low_likelihood], trial_y[trial_low_likelihood],
+              c='red', s=50, alpha=0.8, marker='x', linewidths=2,
+              label=f'Low likelihood (<0.85): {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('Y Coordinate (pixels)', fontsize=11)
+    ax.set_title('Original Y Position', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # Subplot 3: Trajectory on Maze with Estimated Positions
+    ax = fig.add_subplot(gs[0, 2])
+    # Show maze background
+    ax.imshow(maze_image, cmap='gray', alpha=0.5)
+    # Plot trajectory with estimated positions, color-coded by time
+    scatter = ax.scatter(trial_x_est, trial_y_est, 
+                        c=trial_time, cmap='viridis', s=40, alpha=0.8,
+                        edgecolors='white', linewidths=0.5)
+    # Mark interpolated positions with green circles
+    if trial_low_likelihood.sum() > 0:
+        ax.scatter(trial_x_est[trial_low_likelihood], trial_y_est[trial_low_likelihood],
+                  c='lime', s=80, alpha=0.9, marker='o', edgecolors='darkgreen', linewidths=2,
+                  label=f'Interpolated: {trial_low_likelihood.sum()} frames', zorder=5)
+    ax.set_xlabel('X Position (pixels)', fontsize=11)
+    ax.set_ylabel('Y Position (pixels)', fontsize=11)
+    ax.set_title('Trajectory on Maze (with Interpolation)', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=9)
+    # Add colorbar for time
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label('Time (frames)', fontsize=10)
+    
+    # Subplot 4: X coordinate - Estimated with interpolation values
+    ax = fig.add_subplot(gs[1, 0])
+    # Plot high-likelihood points (unchanged)
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_x_est[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot estimated points in green
+    ax.scatter(trial_frames[trial_low_likelihood], trial_x_est[trial_low_likelihood],
+              c='lime', s=50, alpha=0.8, marker='o', edgecolors='darkgreen', linewidths=1.5,
+              label=f'Interpolated: {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('X Coordinate (pixels)', fontsize=11)
+    ax.set_title('Interpolated X Position', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # Subplot 5: Y coordinate - Estimated with interpolation values
+    ax = fig.add_subplot(gs[1, 1])
+    # Plot high-likelihood points (unchanged)
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_y_est[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot estimated points in green
+    ax.scatter(trial_frames[trial_low_likelihood], trial_y_est[trial_low_likelihood],
+              c='lime', s=50, alpha=0.8, marker='o', edgecolors='darkgreen', linewidths=1.5,
+              label=f'Interpolated: {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('Y Coordinate (pixels)', fontsize=11)
+    ax.set_title('Interpolated Y Position', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # Save plot
+    save_path = os.path.join(regression_plots_dir, f'trial_{trial_idx:04d}_piecewise_interpolation.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: trial_{trial_idx:04d}_piecewise_interpolation.png")
+    plt.close()
+
+print(f"\nCompleted! All {len(trials_to_plot)} plots saved to {regression_plots_dir}/")
+
+=== CELL 27 (code) ===
+# Visualize regression-based estimation results
+# Plot trials with the most low-likelihood frames
+
+# Calculate low-likelihood frames per trial
+low_likelihood_per_trial = []
+for trial_idx in range(len(trial_start_frames)):
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    n_low_likelihood = low_likelihood_mask[start_frame:end_frame].sum()
+    low_likelihood_per_trial.append((trial_idx, n_low_likelihood))
+
+# Sort trials by number of low-likelihood frames
+trials_sorted_by_low_likelihood = sorted(low_likelihood_per_trial, key=lambda x: x[1], reverse=True)
+
+# Select trials to plot: top trials with low-likelihood frames that were processed
+n_plots = 200
+trials_to_plot = []
+for trial_idx, n_low in trials_sorted_by_low_likelihood:
+    if trial_idx in trials_processed and len(trials_to_plot) < n_plots:
+        trials_to_plot.append(trial_idx)
+
+print(f"Plotting {len(trials_to_plot)} trials with most low-likelihood frames (that were processed):")
+for trial_idx in trials_to_plot:
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    n_low = low_likelihood_mask[start_frame:end_frame].sum()
+    print(f"  Trial {trial_idx}: {n_low} low-likelihood frames")
+
+# Create output directory
+regression_plots_dir = 'regression_estimation_plots'
+os.makedirs(regression_plots_dir, exist_ok=True)
+
+print(f"\nSaving plots to: {regression_plots_dir}/")
+print("-" * 80)
+
+# Plot each trial
+for plot_idx, trial_idx in enumerate(trials_to_plot):
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    
+    # Get trial data
+    trial_frames = np.arange(start_frame, end_frame)
+    trial_x = headstage_x[start_frame:end_frame]
+    trial_y = headstage_y[start_frame:end_frame]
+    trial_x_est = headstage_x_regressed[start_frame:end_frame]
+    trial_y_est = headstage_y_regressed[start_frame:end_frame]
+    trial_likelihood = headstage_likelihood[start_frame:end_frame]
+    trial_low_likelihood = low_likelihood_mask[start_frame:end_frame]
+    
+    # Create time array for color coding
+    trial_time = np.arange(len(trial_frames))
+    
+    # Create figure with 4 subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'Trial {trial_idx}: Regression-Based Estimation\n'
+                 f'{trial_low_likelihood.sum()} low-likelihood frames estimated', 
+                 fontsize=14, fontweight='bold')
+    
+    # Subplot 1: X coordinate - Original with low-likelihood marked
+    ax = axes[0, 0]
+    # Plot high-likelihood points
+    high_lik_mask = ~trial_low_likelihood
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_x[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot low-likelihood points in red
+    ax.scatter(trial_frames[trial_low_likelihood], trial_x[trial_low_likelihood],
+              c='red', s=50, alpha=0.8, marker='x', linewidths=2,
+              label=f'Low likelihood (<0.85): {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('X Coordinate (pixels)', fontsize=11)
+    ax.set_title('Original X Position', fontsize=12, fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    # Subplot 2: Y coordinate - Original with low-likelihood marked
+    ax = axes[0, 1]
+    # Plot high-likelihood points
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_y[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot low-likelihood points in red
+    ax.scatter(trial_frames[trial_low_likelihood], trial_y[trial_low_likelihood],
+              c='red', s=50, alpha=0.8, marker='x', linewidths=2,
+              label=f'Low likelihood (<0.85): {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('Y Coordinate (pixels)', fontsize=11)
+    ax.set_title('Original Y Position', fontsize=12, fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    # Subplot 3: X coordinate - Estimated with regression values
+    ax = axes[1, 0]
+    # Plot high-likelihood points (unchanged)
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_x_est[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot estimated points in green
+    ax.scatter(trial_frames[trial_low_likelihood], trial_x_est[trial_low_likelihood],
+              c='lime', s=50, alpha=0.8, marker='o', edgecolors='darkgreen', linewidths=1.5,
+              label=f'Estimated: {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('X Coordinate (pixels)', fontsize=11)
+    ax.set_title('Estimated X Position (Linear Regression)', fontsize=12, fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    # Subplot 4: Y coordinate - Estimated with regression values
+    ax = axes[1, 1]
+    # Plot high-likelihood points (unchanged)
+    scatter = ax.scatter(trial_frames[high_lik_mask], trial_y_est[high_lik_mask], 
+                        c=trial_time[high_lik_mask], cmap='viridis', s=30, alpha=0.7,
+                        label='High likelihood (≥0.85)')
+    # Plot estimated points in green
+    ax.scatter(trial_frames[trial_low_likelihood], trial_y_est[trial_low_likelihood],
+              c='lime', s=50, alpha=0.8, marker='o', edgecolors='darkgreen', linewidths=1.5,
+              label=f'Estimated: {trial_low_likelihood.sum()} frames')
+    ax.set_xlabel('Frame Number', fontsize=11)
+    ax.set_ylabel('Y Coordinate (pixels)', fontsize=11)
+    ax.set_title('Estimated Y Position (Linear Regression)', fontsize=12, fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    save_path = os.path.join(regression_plots_dir, f'trial_{trial_idx:04d}_regression_estimation.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: trial_{trial_idx:04d}_regression_estimation.png")
+    plt.close()
+
+print(f"\nCompleted! All {len(trials_to_plot)} plots saved to {regression_plots_dir}/")
+

@@ -1,0 +1,222 @@
+# Plot filtered trajectories per trial (likelihood > 0.9) with missing frames marked
+import os
+
+# Directory to save plots
+save_dir = r"C:\Maze\Video Data\trajectory_plots"
+os.makedirs(save_dir, exist_ok=True)
+
+def plot_filtered_trajectory_per_trial(trial_idx, x, y, likelihood, 
+                                      maze_img, start_frame, end_frame,
+                                      likelihood_threshold=0.9,
+                                      fps=40, figsize=(12, 10),
+                                      save_path=None):
+    """
+    Plot trajectory for a trial, filtering to only high-likelihood frames.
+    Missing frames (low likelihood) are marked with red dots.
+    
+    Parameters:
+    -----------
+    trial_idx : int
+        Trial index
+    x, y : array
+        Full tracking coordinates
+    likelihood : array
+        Tracking confidence
+    maze_img : array
+        Maze background image
+    start_frame, end_frame : int
+        Trial frame boundaries
+    likelihood_threshold : float
+        Minimum likelihood to include in trajectory
+    fps : int
+        Frame rate
+    figsize : tuple
+        Figure size
+    save_path : str, optional
+        Path to save the plot
+    """
+    # Extract trial data
+    trial_length = end_frame - start_frame
+    trial_x = x[start_frame:end_frame]
+    trial_y = y[start_frame:end_frame]
+    trial_likelihood = likelihood[start_frame:end_frame]
+    
+    # Filter to high-likelihood frames
+    high_likelihood_mask = trial_likelihood > likelihood_threshold
+    low_likelihood_mask = ~high_likelihood_mask
+    
+    n_missing = np.sum(low_likelihood_mask)
+    n_total = trial_length
+    missing_percentage = 100 * n_missing / n_total if n_total > 0 else 0
+    
+    # Get filtered data
+    filtered_x = trial_x[high_likelihood_mask]
+    filtered_y = trial_y[high_likelihood_mask]
+    filtered_time = np.arange(trial_length)[high_likelihood_mask] / fps
+    
+    # Get missing frame data
+    missing_x = trial_x[low_likelihood_mask]
+    missing_y = trial_y[low_likelihood_mask]
+    missing_frame_indices = np.where(low_likelihood_mask)[0]
+    missing_frame_numbers = missing_frame_indices + start_frame
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    
+    # Plot 1: Trajectory on maze with time color coding
+    ax = axes[0, 0]
+    ax.imshow(maze_img)
+    
+    if len(filtered_x) > 0:
+        scatter = ax.scatter(filtered_x, filtered_y, c=filtered_time, 
+                           cmap='viridis', s=5, alpha=0.7, 
+                           label=f'High likelihood (>{likelihood_threshold})')
+        cbar = plt.colorbar(scatter, ax=ax)
+        cbar.set_label('Time in trial (s)', rotation=270, labelpad=15)
+    
+    # Mark missing frames with red dots
+    if n_missing > 0:
+        ax.scatter(missing_x, missing_y, c='red', s=2, marker='o', 
+                  edgecolors='white', linewidths=1.5,
+                  label=f'Missing frames (n={n_missing})', zorder=5, alpha=0.8)
+    
+    ax.set_title(f'Trial {trial_idx + 1} - Filtered Trajectory\n'
+                f'{n_total - n_missing}/{n_total} frames ({100 - missing_percentage:.1f}% coverage)', 
+                fontsize=12, fontweight='bold')
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    ax.legend(loc='upper right', fontsize=9)
+    
+    # Plot 2: X coordinate over time
+    ax = axes[0, 1]
+    frame_nums = np.arange(start_frame, end_frame)
+    
+    if len(filtered_x) > 0:
+        filtered_frames = frame_nums[high_likelihood_mask]
+        ax.scatter(filtered_frames, filtered_x, c=filtered_time, 
+                  cmap='viridis', s=5, alpha=0.7)
+    
+    if n_missing > 0:
+        ax.scatter(missing_frame_numbers, missing_x, c='red', s=5, 
+                  marker='o', edgecolors='white', linewidths=1, 
+                  alpha=0.8, zorder=5)
+    
+    ax.set_xlabel('Frame number')
+    ax.set_ylabel('X coordinate (pixels)')
+    ax.set_title('X Position Over Time')
+    ax.grid(alpha=0.3)
+    
+    # Plot 3: Y coordinate over time
+    ax = axes[1, 0]
+    
+    if len(filtered_y) > 0:
+        filtered_frames = frame_nums[high_likelihood_mask]
+        ax.scatter(filtered_frames, filtered_y, c=filtered_time, 
+                  cmap='viridis', s=5, alpha=0.7)
+    
+    if n_missing > 0:
+        ax.scatter(missing_frame_numbers, missing_y, c='red', s=5, 
+                  marker='o', edgecolors='white', linewidths=1, 
+                  alpha=0.8, zorder=5)
+    
+    ax.set_xlabel('Frame number')
+    ax.set_ylabel('Y coordinate (pixels)')
+    ax.set_title('Y Position Over Time')
+    ax.grid(alpha=0.3)
+    
+    # Plot 4: Likelihood over time
+    ax = axes[1, 1]
+    ax.plot(frame_nums, trial_likelihood, 'b-', alpha=0.6, linewidth=1)
+    ax.axhline(likelihood_threshold, color='red', linestyle='--', 
+              linewidth=2, label=f'Threshold: {likelihood_threshold}', alpha=0.7)
+    ax.fill_between(frame_nums, 0, 1, where=low_likelihood_mask,
+                    alpha=0.2, color='red', label='Missing frames')
+    
+    ax.set_xlabel('Frame number')
+    ax.set_ylabel('Likelihood')
+    ax.set_title('Tracking Likelihood')
+    ax.set_ylim([0, 1])
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save if path provided
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved: {save_path}")
+    
+    return fig, n_missing, missing_frame_numbers
+
+
+# Plot and save trajectories for all trials
+print("=" * 70)
+print("PLOTTING FILTERED TRAJECTORIES PER TRIAL")
+print("=" * 70)
+print(f"Likelihood threshold: 0.9")
+print(f"Save directory: {save_dir}")
+print(f"Total trials: {len(trial_start_frames)}")
+print()
+
+# Summary statistics
+all_missing_counts = []
+trials_with_missing = []
+
+# Plot all trials (or subset for testing)
+# Change n_trials_to_plot to len(trial_start_frames) to plot all trials
+n_trials_to_plot = min(50, len(trial_start_frames))  # Plot first 20 trials as example
+print(f"Plotting first {n_trials_to_plot} trials...")
+print()
+
+for trial_idx in range(n_trials_to_plot):
+    start_frame = trial_start_frames[trial_idx]
+    end_frame = trial_end_frames[trial_idx]
+    if end_frame > len(headstage_x):
+        end_frame = len(headstage_x)
+    
+    # Create save path
+    save_path = os.path.join(save_dir, f"trial_{trial_idx + 1:04d}_filtered_trajectory.png")
+    
+    # Plot and save
+    fig, n_missing, missing_frames = plot_filtered_trajectory_per_trial(
+        trial_idx, headstage_x, headstage_y, headstage_likelihood,
+        maze_image, start_frame, end_frame,
+        likelihood_threshold=0.85,
+        save_path=save_path
+    )
+    
+    all_missing_counts.append(n_missing)
+    if n_missing > 0:
+        trials_with_missing.append((trial_idx + 1, n_missing, missing_frames))
+    
+    # Close figure to save memory
+    plt.close(fig)
+    
+    # Print progress every 5 trials
+    if (trial_idx + 1) % 5 == 0:
+        print(f"Completed {trial_idx + 1}/{n_trials_to_plot} trials")
+
+print()
+print("=" * 70)
+print("SUMMARY STATISTICS")
+print("=" * 70)
+print(f"\nTrials processed: {n_trials_to_plot}")
+print(f"Total plots saved to: {save_dir}")
+print(f"\nMissing frames statistics:")
+print(f"  Mean missing frames per trial: {np.mean(all_missing_counts):.1f}")
+print(f"  Median missing frames per trial: {np.median(all_missing_counts):.1f}")
+print(f"  Max missing frames: {np.max(all_missing_counts)}")
+print(f"  Trials with missing frames: {len(trials_with_missing)}/{n_trials_to_plot}")
+
+if len(trials_with_missing) > 0:
+    print(f"\nTop 10 trials with most missing frames:")
+    trials_with_missing.sort(key=lambda x: x[1], reverse=True)
+    for trial_num, n_missing, missing_frames in trials_with_missing[:10]:
+        print(f"  Trial {trial_num}: {n_missing} missing frames")
+        # Show first few frame numbers
+        if len(missing_frames) <= 5:
+            print(f"    Frames: {list(missing_frames)}")
+        else:
+            print(f"    First 5 frames: {list(missing_frames[:5])}, ...")
+
+print(f"\n✓ All plots saved successfully!")
